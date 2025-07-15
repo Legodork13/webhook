@@ -1,74 +1,93 @@
 from flask import Flask, request, jsonify
 import os
 import requests
+from datetime import datetime
 
 app = Flask(__name__)
 
+# Конфигурация
 TOKENVIEW_API_KEY = os.getenv('TOKENVIEW_API_KEY')
 VERCEL_URL = os.getenv('VERCEL_URL')
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')  # DEBUG, INFO, WARNING, ERROR
+
+def log(message, level='INFO'):
+    """Логирование с временной меткой"""
+    if LOG_LEVEL == 'DEBUG' or level in ('ERROR', 'WARNING'):
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{timestamp}] [{level}] {message}")
 
 @app.route('/api/webhook', methods=['GET', 'POST'])
 def handle_webhook():
-    if request.method == 'GET':
-        # Tokenview проверяет URL - просто возвращаем успешный статус
-        return jsonify({"status": "OK", "message": "Webhook is ready"}), 200
-    
-    elif request.method == 'POST':
-        try:
-            # Проверка подписи
-            signature = request.headers.get('X-Tokenview-Signature')
-            if not signature or signature != TOKENVIEW_API_KEY:
-                return jsonify({"error": "Invalid signature"}), 401
+    try:
+        # Логируем входящий запрос
+        log(f"Incoming request: {request.method} {request.url}")
+        log(f"Headers: {dict(request.headers)}", 'DEBUG')
+        
+        if request.method == 'GET':
+            log("GET verification request received")
+            return jsonify({
+                "status": "OK",
+                "message": "Webhook is ready",
+                "timestamp": datetime.now().isoformat()
+            }), 200
 
-            data = request.json
+        elif request.method == 'POST':
+            # Проверка подписи (с поддержкой разных вариантов заголовка)
+            signature = (
+                request.headers.get('X-Tokenview-Signature') or 
+                request.headers.get('Tokenview-Signature') or 
+                request.headers.get('X-Signature')
+            )
             
-            # Обработка разных типов событий
-            event_handlers = {
-                'transaction': handle_transaction,
-                'token_create': handle_token_create,
-                'whale_alert': handle_whale_alert,
-                'web3_event': handle_web3_event
+            if not signature:
+                log("No signature header found", 'WARNING')
+                # return jsonify({"error": "Signature required"}), 401  # Раскомментируйте для строгой проверки
+            
+            if signature and signature != TOKENVIEW_API_KEY:
+                log(f"Invalid signature. Received: {signature}", 'ERROR')
+                return jsonify({
+                    "error": "Invalid signature",
+                    "received_signature": signature[:6] + "..." if signature else None,
+                    "expected_length": len(TOKENVIEW_API_KEY) if TOKENVIEW_API_KEY else 0
+                }), 401
+
+            # Обработка тела запроса
+            data = request.get_json()
+            if not data:
+                log("Empty request body", 'WARNING')
+                return jsonify({"error": "No data provided"}), 400
+
+            log(f"Received data: {data}", 'DEBUG')
+            
+            # Здесь можно добавить обработку разных типов событий
+            response = {
+                "status": "processed",
+                "event_type": data.get('type'),
+                "timestamp": datetime.now().isoformat()
             }
             
-            handler = event_handlers.get(data.get('type'))
-            if handler:
-                return handler(data)
-            return jsonify({"error": "Unknown event type"}), 400
+            # Отправляем в Telegram бот
+            bot_response = requests.post(
+                f"{VERCEL_URL}/api/bot",
+                json={
+                    "source": "tokenview",
+                    "original_data": data,
+                    "processed_at": datetime.now().isoformat()
+                },
+                timeout=5
+            )
+            
+            if bot_response.status_code != 200:
+                log(f"Telegram bot error: {bot_response.text}", 'ERROR')
+            
+            return jsonify(response), 200
 
-        except Exception as e:
-            print(f"Error processing webhook: {str(e)}")
-            return jsonify({"error": "Internal server error"}), 500
-
-    else:
-        return jsonify({"error": "Method not allowed"}), 405
-
-def handle_transaction(data):
-    # Формируем сообщение о транзакции
-    message = (
-        f"🔔 Новая транзакция (ETH):\n\n"
-        f"📝 Хеш: {data.get('hash', 'N/A')}\n"
-        f"📦 Блок: {data.get('block_number', 'N/A')}\n"
-        f"📤 От: {data.get('from', 'N/A')}\n"
-        f"📥 Кому: {data.get('to', 'N/A')}\n"
-        f"💰 Сумма: {data.get('value', '0')} ETH\n"
-        f"⏱ Время: {data.get('timestamp', 'N/A')}"
-    )
-    
-    # Отправляем в Telegram через наш бот
-    bot_response = requests.post(
-        f"{VERCEL_URL}/api/bot",
-        json={
-            "type": "transaction",
-            "message": message,
-            "original_data": data
-        }
-    )
-    
-    if bot_response.status_code == 200:
-        return jsonify({"status": "Transaction processed"}), 200
-    return jsonify({"error": "Failed to send to Telegram"}), 500
-
-# ... (остальные обработчики handle_token_create, handle_whale_alert, handle_web3_event остаются без изменений)
+    except Exception as e:
+        log(f"Unexpected error: {str(e)}", 'ERROR')
+        return jsonify({
+            "error": "Internal server error",
+            "details": str(e)
+        }), 500
 
 if __name__ == '__main__':
-    app.run()
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
